@@ -479,12 +479,12 @@ UIMode.Connect = class extends UIMode {
     /// target are compatible with each other.
     connect(ui, event) {
         if (this.reconnect === null) {
-            if (!event.shiftKey && !event.metaKey && !event.ctrlKey) {
+            if (!ui.extends_selection(event)) {
                 ui.deselect();
             }
             const edge = UIMode.Connect.create_edge(ui, this.source, this.target);
             ui.select(edge);
-            if (!event.shiftKey && !event.metaKey && !event.ctrlKey) {
+            if (!ui.extends_selection(event)) {
                 if (event.isTrusted) {
                     // Don't focus the input on touchscreens, since this can be
                     // offputting, as it often brings up a virtual keyboard.
@@ -756,6 +756,13 @@ class UI {
         // action, we will push a new history state rather than replacing, so that the initial
         // diagram is kept in the history.
         this.start_new_history = this.settings.get("quiver.autosave");
+
+        // Whether clicking (or tapping) cells adds them to the selection, as if Shift were held.
+        // This is primarily useful on touchscreens, where there are no modifier keys.
+        this.multiselect = false;
+
+        // Backups of the diagram in `localStorage`, so that work is not lost if the page is closed.
+        this.backup = new LocalBackup();
     }
 
     /// Clear the current diagram. This also clears the history.
@@ -929,7 +936,8 @@ class UI {
             ]))
             .add(new DOM.Element("h2").add("Navigation"))
             .add(new DOM.Table([
-                ["Pan view", "Scroll"],
+                ["Pan view", "Scroll, middle-click and drag, or drag with two fingers"],
+                ["Zoom view", "Pinch"],
                 // Technically "pointer panning", but "mouse panning" is likely less confusing
                 // overall for users.
                 ["Enable mouse panning", (td) => Shortcuts.element(td, [
@@ -1180,7 +1188,9 @@ class UI {
                 "Double-click to create a new object.",
                 "Edit labels with the input bar at the bottom of the screen.",
                 "Click and drag the empty space around a object to move it around.",
-                "Hold Shift (⇧) to select multiple cells to edit them simultaneously."
+                "Hold Shift (⇧) to select multiple cells to edit them simultaneously. On a " +
+                "touchscreen, use Select → Multiple instead.",
+                "On a touchscreen, drag with two fingers to pan, and pinch to zoom."
             ]))
             .add(new DOM.Element("p")
                 .add("For a detailed guide to using ")
@@ -1383,14 +1393,80 @@ class UI {
             this.mode.origin = this.offset_from_event(touch).sub(this.view);
         };
 
+        // Dragging with two fingers pans the view, and pinching zooms. `pinch` is `null` if no such
+        // gesture is taking place, and otherwise records the scale and distance between the touches
+        // at the start of the gesture, and the point in the diagram between the touches, which we
+        // keep between the touches as they move.
+        let pinch = null;
+        // Whether the current touch interaction has involved multiple touches. In this case, we
+        // do not treat the touches ending as pointer releases.
+        let multitouch = false;
+        // The touch pointers that are currently down.
+        const touch_pointers = new Set();
+        // The selection before the first touch of a gesture. The first touch is handled as an
+        // ordinary pointer event (e.g. deselecting cells when touching empty space), so we restore
+        // the selection if the touch turns out to be the start of a pinch gesture.
+        let selection_before_touch = new Set();
+
+        const touch_midpoint = (touches) => new Offset(
+            (touches[0].pageX + touches[1].pageX) / 2,
+            (touches[0].pageY + touches[1].pageY) / 2,
+        );
+        const touch_distance = (touches) => Math.hypot(
+            touches[0].pageX - touches[1].pageX,
+            touches[0].pageY - touches[1].pageY,
+        );
+
+        // Multiple touches can cause strange behaviours, because they don't follow the usual rules
+        // (e.g. two consecutive `pointerdown`s without an intervening `pointerup`). Therefore, we
+        // ignore `pointerdown` events for any touch after the first: these are handled as pinch
+        // gestures instead.
+        window.addEventListener(pointer_event("down"), (event) => {
+            if (event.pointerType === "touch") {
+                touch_pointers.add(event.pointerId);
+                if (touch_pointers.size === 1) {
+                    selection_before_touch = new Set(this.selection);
+                }
+                if (touch_pointers.size > 1) {
+                    event.stopImmediatePropagation();
+                }
+            }
+        }, { capture: true });
+        for (const type of ["up", "cancel"]) {
+            window.addEventListener(pointer_event(type), (event) => {
+                touch_pointers.delete(event.pointerId);
+            }, { capture: true });
+        }
+
         document.addEventListener("touchstart", (event) => {
             is_touching = true;
             if (event.touches.length > 1) {
-                // Multiple touches can cause strange behaviours, because they don't follow the
-                // usual rules (e.g. two consecutive `pointerdown`s without an intervening
-                // `pointerup`).
-                if (this.in_mode(UIMode.Default)) {
+                multitouch = true;
+                if (long_press_timer !== null) {
+                    window.clearTimeout(long_press_timer);
+                    long_press_timer = null;
+                }
+                // We don't want to pan or zoom when interacting with the interface (e.g. scrolling
+                // the toolbar).
+                const on_interface = event.target instanceof Element && event.target.closest(
+                    ".toolbar, .panel, .pane, .error-banner, .label-input-container"
+                ) !== null;
+                if (pinch === null && !on_interface
+                    && this.in_mode(UIMode.Default, UIMode.Connect, UIMode.Pan)
+                ) {
                     this.cancel_creation();
+                    this.deselect();
+                    this.select(...selection_before_touch);
+                    this.panel.hide_if_unselected(this);
+                    this.switch_mode(new UIMode.Pan(null));
+                    // We handle panning in `touchmove`, rather than via the pointer.
+                    this.mode.origin = null;
+                    const midpoint = touch_midpoint(event.touches);
+                    pinch = {
+                        anchor: this.offset_from_event({ pageX: midpoint.x, pageY: midpoint.y }),
+                        distance: Math.max(touch_distance(event.touches), 1),
+                        scale: this.scale,
+                    };
                 }
             } else if (long_press_timer === null) {
                 long_press_timer = window.setTimeout(
@@ -1405,10 +1481,26 @@ class UI {
 
         // If the touch position moves, we disable the long press. We use `touchmove` instead of
         // `pointermove`, because that has some leeway around minute changes in the position.
-        document.addEventListener("touchmove", () => {
+        document.addEventListener("touchmove", (event) => {
             if (!this.in_mode(UIMode.Pan) && long_press_timer !== null) {
                 window.clearTimeout(long_press_timer);
                 long_press_timer = null;
+            }
+            if (pinch !== null && event.touches.length > 1) {
+                // Zoom according to how far the touches have moved apart, and pan so that the
+                // point in the diagram that started between the touches remains between them.
+                const scale = clamp(
+                    CONSTANTS.MIN_ZOOM,
+                    pinch.scale + Math.log2(touch_distance(event.touches) / pinch.distance),
+                    CONSTANTS.MAX_ZOOM,
+                );
+                const midpoint = touch_midpoint(event.touches);
+                const centre = new Offset(
+                    document.body.offsetWidth / 2,
+                    document.body.offsetHeight / 2,
+                );
+                this.focus_point.class_list.remove("revealed", "pending", "active");
+                this.pan_to(pinch.anchor.sub(midpoint.sub(centre).div(2 ** scale)), scale);
             }
         });
 
@@ -1458,6 +1550,25 @@ class UI {
         // Manually track touch end events, which do not properly trigger `pointerup` events
         // automatically.
         document.addEventListener("touchend", (event) => {
+            if (pinch !== null && event.touches.length < 2) {
+                pinch = null;
+                // Update the zoom level displayed in the toolbar.
+                this.toolbar.update(this);
+            }
+            if (multitouch) {
+                // We don't treat the end of a multitouch gesture as a pointer release, since the
+                // user was panning or zooming rather than interacting with what is under the
+                // touches.
+                if (event.touches.length === 0) {
+                    multitouch = false;
+                    if (this.in_mode(UIMode.Pan)) {
+                        this.switch_mode(UIMode.default);
+                    }
+                    is_touching = false;
+                    touched_element = null;
+                }
+                return;
+            }
             if (this.in_mode(UIMode.Pan)) {
                 this.switch_mode(UIMode.default);
             } if (event.changedTouches.length === 1) {
@@ -1481,6 +1592,10 @@ class UI {
         });
 
         document.addEventListener(pointer_event("up"), (event) => {
+            if (event.button === 1 && this.in_mode(UIMode.Pan) && this.mode.key === null) {
+                // Stop panning with the middle mouse button.
+                this.switch_mode(UIMode.default);
+            }
             if (event.button === 0) {
                 if (event.pointerType !== "touch") {
                     if (this.in_mode(UIMode.Pan)) {
@@ -1516,6 +1631,24 @@ class UI {
 
         this.reposition_focus_point(Position.zero());
 
+        // Dragging with the middle mouse button pans the view.
+        this.element.listen(pointer_event("down"), (event) => {
+            if (event.button === 1 && this.in_mode(UIMode.Default)) {
+                // Prevent autoscrolling.
+                event.preventDefault();
+                this.cancel_creation();
+                this.switch_mode(new UIMode.Pan(null));
+                this.mode.origin = this.offset_from_event(event).sub(this.view);
+            }
+        });
+        this.element.listen("mousedown", (event) => {
+            if (event.button === 1) {
+                // Prevent autoscrolling in browsers that do not respect `preventDefault` on
+                // `pointerdown` for this purpose.
+                event.preventDefault();
+            }
+        });
+
         this.element.listen(pointer_event("down"), (event) => {
             if (event.button === 0) {
                 // Usually, if `Alt` or `Control` have been held we will have already switched to
@@ -1547,7 +1680,7 @@ class UI {
                 } else if (this.in_mode(UIMode.KeyMove)) {
                     this.switch_mode(UIMode.default);
                 } else if (!this.in_mode(UIMode.Modal)) {
-                    if (!event.shiftKey && !event.metaKey && !event.ctrlKey) {
+                    if (!this.extends_selection(event)) {
                         // Deselect cells when the pointer is pressed (at least when the
                         // Shift/Command/Control keys are not held).
                         this.deselect();
@@ -1574,7 +1707,7 @@ class UI {
             this.focus_point.class_list.remove("revealed");
             // We want the new vertex to be the only selected cell, unless we've held
             // Shift/Command/Control when creating it.
-            if (!event.shiftKey && !event.metaKey && !event.ctrlKey) {
+            if (!this.extends_selection(event)) {
                 this.deselect();
             }
             const vertex = create_vertex(this.focus_position);
@@ -1629,7 +1762,7 @@ class UI {
                         // When the user is creating a vertex and adding it to the selection,
                         // it is unlikely they expect to edit all the labels simultaneously,
                         // so in this case we do not focus the input.
-                        if (!event.shiftKey && !event.metaKey && !event.ctrlKey) {
+                        if (!this.extends_selection(event)) {
                             this.panel.label_input.element.select();
                         }
                     }
@@ -1685,7 +1818,7 @@ class UI {
                                 // add the new vertex to the selection) we want to focus and select
                                 // the new vertex.
                                 const { edge, end } = this.mode.reconnect;
-                                if (!event.shiftKey && !event.metaKey && !event.ctrlKey) {
+                                if (!this.extends_selection(event)) {
                                     this.panel.label_input.element.select();
                                 }
                                 actions.push({
@@ -1702,7 +1835,7 @@ class UI {
                             // allows us to tab sequentially through the source, morphism, and
                             // target.
                             if (this.mode.forged_vertex) {
-                                if (!event.shiftKey && !event.metaKey && !event.ctrlKey) {
+                                if (!this.extends_selection(event)) {
                                     this.deselect();
                                     this.select(this.mode.source);
                                     this.panel.hide_if_unselected(this);
@@ -2279,7 +2412,7 @@ class UI {
                                 );
                             }
                         });
-                        if (!event.shiftKey && !event.metaKey && !event.ctrlKey) {
+                        if (!this.extends_selection(event)) {
                             this.deselect();
                         }
                         this.select(target);
@@ -2469,58 +2602,37 @@ class UI {
             }
         });
 
-        // Copying and pasting.
-        this.shortcuts.add([
-            { key: "C", modifier: true, context: Shortcuts.SHORTCUT_PRIORITY.Defer },
-            { key: "X", modifier: true }
-        ], () => {
+        // Copying and cutting are handled by the toolbar buttons (and their keyboard shortcuts).
+        // Pasting is handled via the `paste` event, rather than a keyboard shortcut, as this gives
+        // us access to the system clipboard without requesting permission.
+        let paste_handled = false;
+        document.addEventListener("paste", (event) => {
             if (this.in_mode(UIMode.Default, UIMode.Pan) && !this.input_is_active()) {
-                this.clipboard = QuiverImportExport.base64.export_selection(
-                    this.quiver,
-                    this.quiver.transitive_reverse_dependencies(this.selection),
+                event.preventDefault();
+                paste_handled = true;
+                this.paste(
+                    UI.diagram_encoding_from_text(event.clipboardData.getData("text/plain"))
+                        ?? this.clipboard
                 );
+                Shortcuts.flash(this.toolbar.element.query_selector('.action[data-name="paste"]'));
             }
         });
-
-        this.shortcuts.add([{ key: "X", modifier: true }], () => {
-            if (this.in_mode(UIMode.Default, UIMode.Pan) && !this.input_is_active()) {
-                // This keyboard shortcut will first trigger the copy action.
-                this.history.add(this, [{
-                    kind: "delete",
-                    cells: this.quiver.transitive_dependencies(this.selection),
-                }], true);
-                this.panel.update(this);
-            }
-        });
-
-        this.shortcuts.add([{ key: "V", modifier: true }], () => {
-            if (this.in_mode(UIMode.Default, UIMode.Pan) && !this.input_is_active()) {
-                if (this.clipboard === "") {
-                    return;
-                }
-                try {
-                    const cells = new Set(QuiverImportExport.base64.import(
-                        this,
-                        this.clipboard,
-                        this.focus_position,
-                        false,
-                    ));
-                    this.history.add(this, [{ kind: "create", cells }]);
-                } catch (_) {
-                    const centre_offset = this.cell_centre_at_position(this.focus_position);
-                    const offset = this.offset_from_position(this.focus_position);
-                    const paste_error = new DOM.Div({ class: "inline-error" }, {
-                            left: `${offset.x + centre_offset.x}px`,
-                            top: `${offset.y}px`,
-                        })
-                        .add("You can't paste here!")
-                        .add_to(this.canvas);
-                    delay(() => {
-                        paste_error.class_list.add("hidden");
-                        delay(() => paste_error.remove(), 100);
-                    }, 1000);
-                }
-                this.focus_point.class_list.remove("revealed", "pending", "active");
+        // Some browsers (e.g. Safari) do not fire a `paste` event when no editable element is
+        // focused. In this case, we fall back to pasting from the internal clipboard.
+        document.addEventListener("keydown", (event) => {
+            const modifier = event.metaKey || (event.ctrlKey && !Shortcuts.is_Apple_platform());
+            if (event.key.toLowerCase() === "v" && modifier && !event.shiftKey && !event.altKey) {
+                paste_handled = false;
+                setTimeout(() => {
+                    if (!paste_handled && this.in_mode(UIMode.Default, UIMode.Pan)
+                        && !this.input_is_active()
+                    ) {
+                        this.paste(this.clipboard);
+                        Shortcuts.flash(
+                            this.toolbar.element.query_selector('.action[data-name="paste"]')
+                        );
+                    }
+                }, 8);
             }
         });
 
@@ -3091,6 +3203,12 @@ class UI {
         return this.ids.get(object);
     }
 
+    /// Whether a pointer or keyboard event should add to (or toggle cells in) the selection, rather
+    /// than replace it.
+    extends_selection(event) {
+        return event.shiftKey || event.metaKey || event.ctrlKey || this.multiselect;
+    }
+
     /// Returns the active element if it is a text input field. (If it is, certain
     /// actions (primarily keyboard shortcuts) will be disabled.)
     input_is_active() {
@@ -3197,6 +3315,30 @@ class UI {
             body.add(error);
             // Animate the banner's entry.
             delay(() => error.class_list.remove("hidden"));
+        }
+    }
+
+    /// Display a notice banner, with buttons for the given `actions` (an array of
+    /// `[label, callback]` pairs). The notice is dismissed when any of the buttons are clicked.
+    /// Notices share their styling (and dismissal logic) with error banners.
+    static display_notice(message, actions, type) {
+        const body = new DOM.Element(document.body);
+        if (body.query_selector(".error-banner:not(.hidden)") === null) {
+            const notice = new DOM.Div({ class: "error-banner notice hidden", "data-type": type })
+                .listen(pointer_event("down"), (event) => event.stopPropagation())
+                .add(message);
+            for (const [label, callback] of actions) {
+                notice.add(new DOM.Element("button").add(label).listen("click", () => {
+                    UI.dismiss_error(type);
+                    callback();
+                }));
+            }
+            notice.add(
+                new DOM.Element("button", { class: "close" })
+                    .listen("click", () => UI.dismiss_error(type))
+            );
+            body.add(notice);
+            delay(() => notice.class_list.remove("hidden"));
         }
     }
 
@@ -3643,6 +3785,87 @@ class UI {
         }
     }
 
+    /// Copy the selected cells (and the cells on which they depend, such as the endpoints of edges)
+    /// to the clipboard. The cells are stored in an internal clipboard, and a link to a diagram
+    /// containing them is copied to the system clipboard, so that they may be pasted into another
+    /// tab or device.
+    copy_selection() {
+        this.clipboard = QuiverImportExport.base64.export_selection(
+            this.quiver,
+            this.quiver.transitive_reverse_dependencies(this.selection),
+        );
+        const URL_prefix = window.location.href.replace(/\?.*$/, "").replace(/#.*$/, "");
+        if (navigator.clipboard) {
+            // Writing to the clipboard may fail (e.g. if the document is not focused), in which
+            // case we can still paste from the internal clipboard.
+            navigator.clipboard.writeText(`${URL_prefix}#q=${this.clipboard}`).catch(() => {});
+        }
+    }
+
+    /// Extract an encoded diagram from some text, which may be either a quiver link or the
+    /// encoding itself. Returns `null` if the text does not contain a valid encoding.
+    static diagram_encoding_from_text(text) {
+        text = text.trim();
+        const match = text.match(/[#?&]q=([A-Za-z0-9+/=%]+)/);
+        const encoding = match !== null ? decodeURIComponent(match[1]) : text;
+        try {
+            const data = JSON.parse(new TextDecoder().decode(
+                Uint8Array.from(atob(encoding), (c) => c.charCodeAt(0))
+            ));
+            return Array.isArray(data) ? encoding : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /// Paste an encoded diagram at the focus point, and select the pasted cells.
+    paste(encoding) {
+        if (encoding === null || encoding === "") {
+            return;
+        }
+        try {
+            const cells = new Set(QuiverImportExport.base64.import(
+                this,
+                encoding,
+                this.focus_position,
+                false,
+            ));
+            this.deselect();
+            this.select(...cells);
+            this.history.add(this, [{ kind: "create", cells }], false, new Set());
+            this.panel.update(this);
+        } catch (_) {
+            const centre_offset = this.cell_centre_at_position(this.focus_position);
+            const offset = this.offset_from_position(this.focus_position);
+            const paste_error = new DOM.Div({ class: "inline-error" }, {
+                    left: `${offset.x + centre_offset.x}px`,
+                    top: `${offset.y}px`,
+                })
+                .add("You can't paste here!")
+                .add_to(this.canvas);
+            delay(() => {
+                paste_error.class_list.add("hidden");
+                delay(() => paste_error.remove(), 100);
+            }, 1000);
+        }
+        this.focus_point.class_list.remove("revealed", "pending", "active");
+    }
+
+    /// Back up the current diagram in `localStorage`.
+    back_up_diagram() {
+        if (this.in_mode(UIMode.Embedded)) {
+            return;
+        }
+        const { data } = this.quiver.export(
+            "base64",
+            this.settings,
+            this.options(),
+            this.definitions(),
+        );
+        const hash = data.indexOf("#");
+        this.backup.save(hash !== -1 ? data.slice(hash + 1) : "");
+    }
+
     /// Save the current diagram in the URL.
     save_diagram(is_necessary = true) {
         // `data` is the new URL.
@@ -3659,6 +3882,11 @@ class UI {
 
     /// Save the current diagram if it is not currently saved.
     autosave_diagram() {
+        // Any notice offering to restore or discard a backup is no longer relevant once the user
+        // has modified the diagram.
+        UI.dismiss_error("backup");
+        this.back_up_diagram();
+
         if (this.start_new_history) {
             this.start_new_history = false;
             this.save_diagram();
@@ -3677,6 +3905,87 @@ class UI {
         }
     }
 }
+
+/// Backups of diagrams in `localStorage`, so that work is not lost if the page is closed or
+/// reloaded (e.g. when a mobile browser reclaims a tab in the background). Each tab has its own
+/// backup, so that diagrams in different tabs do not overwrite one another.
+class LocalBackup {
+    constructor() {
+        // An identifier for this tab, which persists across reloads (since `sessionStorage` does).
+        // If storage is not available, this is `null` and no backups will be made.
+        this.tab = null;
+        try {
+            this.tab = window.sessionStorage.getItem(LocalBackup.TAB_KEY);
+            if (this.tab === null) {
+                this.tab = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+                window.sessionStorage.setItem(LocalBackup.TAB_KEY, this.tab);
+            }
+        } catch (_) {
+            this.tab = null;
+        }
+
+        // We do not save backups until any existing backup has been dealt with (i.e. restored or
+        // ignored), to avoid overwriting it before it has been loaded.
+        this.enabled = false;
+    }
+
+    /// Returns all the backups, most recent first. Each backup is of the form
+    /// `{ tab, fragment, base, time }`, where `fragment` is the URL fragment encoding the diagram,
+    /// and `base` is the URL fragment of the page when the backup was made.
+    entries() {
+        try {
+            const entries = JSON.parse(window.localStorage.getItem(LocalBackup.KEY));
+            if (Array.isArray(entries)) {
+                return entries.filter((entry) => {
+                    return entry !== null && typeof entry.fragment === "string";
+                });
+            }
+        } catch (_) {
+            // Fall through: treat malformed data as there being no backups.
+        }
+        return [];
+    }
+
+    /// Save `fragment` as this tab's backup. An empty `fragment` (i.e. an empty diagram), or one
+    /// matching the URL, removes this tab's backup.
+    save(fragment) {
+        if (!this.enabled || this.tab === null) {
+            return;
+        }
+        const entries = this.entries().filter((entry) => entry.tab !== this.tab);
+        const base = window.location.hash.replace(/^#/, "");
+        // If the diagram is the same as the one in the URL, then there are no unsaved changes to
+        // back up.
+        if (fragment !== "" && fragment !== base) {
+            entries.unshift({ tab: this.tab, fragment, base, time: Date.now() });
+        }
+        try {
+            window.localStorage.setItem(
+                LocalBackup.KEY,
+                JSON.stringify(entries.slice(0, LocalBackup.MAX_ENTRIES)),
+            );
+        } catch (_) {
+            // Storage may be full or disabled, in which case there is nothing we can do.
+        }
+    }
+
+    /// Returns this tab's backup, if it was made from the page that is currently loaded (i.e. the
+    /// tab has been reloaded, rather than navigated to a different diagram), or `null` otherwise.
+    own() {
+        const base = window.location.hash.replace(/^#/, "");
+        return this.entries().find((entry) => entry.tab === this.tab && entry.base === base)
+            || null;
+    }
+
+    /// Returns the most recent backup, or `null` if there is none.
+    latest() {
+        return this.entries()[0] || null;
+    }
+}
+LocalBackup.KEY = "quiver.backups";
+LocalBackup.TAB_KEY = "quiver.tab";
+// The maximum number of backups to keep (i.e. the number of tabs whose diagrams are kept).
+LocalBackup.MAX_ENTRIES = 8;
 
 /// The history system (i.e. undo and redo).
 class History {
@@ -6972,6 +7281,20 @@ class Toolbar {
                     subaction.class_list.remove("flash");
                 });
             });
+            // Subtoolbars are revealed on hover, but this is not reliable on touchscreens, so we
+            // also allow them to be opened and closed by clicking (or tapping).
+            action.listen("click", (event) => {
+                action.class_list.toggle(
+                    "open",
+                    !subtoolbar.element.contains(event.target)
+                        && !action.class_list.contains("open"),
+                );
+            });
+            document.addEventListener(pointer_event("down"), (event) => {
+                if (!action.element.contains(event.target)) {
+                    action.class_list.remove("open");
+                }
+            }, { capture: true });
             action.add(subtoolbar);
             return subtoolbar;
         };
@@ -7037,6 +7360,28 @@ class Toolbar {
             },
             select,
         );
+        // Toggle whether clicking (or tapping) on cells adds them to the selection. This is
+        // equivalent to holding Shift, which is not possible on touchscreens.
+        const select_multiple = add_action(
+            "Multiple",
+            "select-multiple",
+            [],
+            () => {
+                ui.multiselect = !ui.multiselect;
+                select_multiple.class_list.toggle("toggled", ui.multiselect);
+                select.parent.class_list.toggle("toggled", ui.multiselect);
+            },
+            select,
+        );
+
+        const delete_selection = () => {
+            ui.history.add(ui, [{
+                kind: "delete",
+                cells: ui.quiver.transitive_dependencies(ui.selection),
+            }], true);
+            ui.panel.update(ui);
+        };
+
         add_action(
             "Delete",
             "delete",
@@ -7044,14 +7389,61 @@ class Toolbar {
                 { key: "Backspace" },
                 { key: "Delete" },
             ],
-            () => {
-                ui.history.add(ui, [{
-                    kind: "delete",
-                    cells: ui.quiver.transitive_dependencies(ui.selection),
-                }], true);
-                ui.panel.update(ui);
+            delete_selection,
+        );
+
+        // Whether a copy or cut action should take place. When triggered by a keyboard shortcut
+        // while a text input is focused, we only copy cells if no text is selected in the input,
+        // so as not to interfere with copying text.
+        const should_copy = (event) => {
+            const input = ui.input_is_active();
+            return event.type === "click" || !input
+                || input.selectionStart === input.selectionEnd;
+        };
+
+        add_action(
+            "Copy",
+            "copy",
+            [{ key: "C", modifier: true, context: Shortcuts.SHORTCUT_PRIORITY.Defer }],
+            (event) => {
+                if (should_copy(event)) {
+                    ui.copy_selection();
+                }
             },
         );
+
+        add_action(
+            "Cut",
+            "cut",
+            [{ key: "X", modifier: true }],
+            (event) => {
+                if (should_copy(event)) {
+                    ui.copy_selection();
+                    delete_selection();
+                }
+            },
+        );
+
+        // Pasting via the keyboard is handled by listening for `paste` events (see
+        // `UI.initialise`), so we do not register a keyboard shortcut here, and simply display it.
+        const paste = add_action(
+            "Paste",
+            "paste",
+            [],
+            async () => {
+                // Prefer the system clipboard, so that diagrams copied in other tabs or apps may be
+                // pasted. Reading the clipboard may require permission, so we fall back to the
+                // internal clipboard if it is not possible.
+                let encoding = null;
+                try {
+                    encoding = UI.diagram_encoding_from_text(await navigator.clipboard.readText());
+                } catch (_) {
+                    // Fall through to the internal clipboard.
+                }
+                ui.paste(encoding ?? ui.clipboard);
+            },
+        );
+        paste.query_selector(".shortcut").add(Shortcuts.name([{ key: "V", modifier: true }]));
 
         const transform = add_subtoolbar("Transform", "transform");
 
@@ -7426,6 +7818,9 @@ class Toolbar {
         );
         enable_if("deselect-all", ui.in_mode(...default_pan) && ui.selection.size > 0);
         enable_if("delete", ui.in_mode(...default_pan) && ui.selection.size > 0);
+        enable_if("copy", ui.in_mode(...default_pan) && ui.selection.size > 0);
+        enable_if("cut", ui.in_mode(...default_pan) && ui.selection.size > 0);
+        enable_if("paste", ui.in_mode(...default_pan));
         enable_if("transform", ui.in_mode(...default_pan) && ui.quiver.all_cells().length > 0);
         enable_if("centre-view",
             ui.element.query_selector(".focus-point.focused")
@@ -7899,14 +8294,14 @@ class Cell {
                         input.element.blur();
                     }
 
-                    was_previously_selected = !event.shiftKey && !event.metaKey && !event.ctrlKey
+                    was_previously_selected = !ui.extends_selection(event)
                         && ui.selection.has(this) &&
                         // If the label input is already focused, then we defocus it.
                         // This allows the user to easily switch between editing the
                         // entire cell and the label.
                         !ui.input_is_active();
 
-                    if (!event.shiftKey && !event.metaKey && !event.ctrlKey) {
+                    if (!ui.extends_selection(event)) {
                         // Deselect all other nodes.
                         ui.deselect();
                         ui.select(this);
@@ -8596,8 +8991,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const ui = new UI(body);
     ui.initialise();
 
-    const load_quiver_from_query_string = () => {
-        const query_data = url_parameters();
+    const load_quiver_from_query_string = (query_data = url_parameters()) => {
 
         // Set the initial zoom level based on the `scale` parameter.
         if (query_data.has("scale")) {
@@ -8719,12 +9113,66 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     };
 
+    // Load the diagram, restoring a backup from `localStorage` if appropriate. If this tab has
+    // been reloaded (e.g. because the browser discarded it in the background) and the diagram had
+    // unsaved changes, we restore its backup automatically. Otherwise, if no diagram is being
+    // loaded, we offer to restore the most recent backup from any tab.
+    const load_quiver_or_backup = () => {
+        const query_data = url_parameters();
+        if (query_data.has("embed")) {
+            load_quiver_from_query_string();
+            return;
+        }
+        // Once any existing backup has been dealt with, we may start making new backups.
+        ui.backup.enabled = true;
+        // Backups are only made when the diagram differs from the URL, so if there is a backup
+        // for the current page, it contains unsaved changes.
+        const own = ui.backup.own();
+        if (own !== null) {
+            load_quiver_from_query_string(url_parameters(`#${own.fragment}`));
+            UI.display_notice("Restored unsaved changes to the diagram.", [
+                ["Discard changes", () => {
+                    ui.reset();
+                    load_quiver_from_query_string();
+                    ui.back_up_diagram();
+                }],
+            ], "backup");
+            return;
+        }
+        load_quiver_from_query_string();
+        if (!query_data.has("q")) {
+            const latest = ui.backup.latest();
+            if (latest !== null) {
+                const time = new Date(latest.time).toLocaleString(undefined, {
+                    dateStyle: "medium",
+                    timeStyle: "short",
+                });
+                UI.display_notice(`Unsaved diagram found from ${time}.`, [
+                    ["Restore", () => {
+                        ui.reset();
+                        load_quiver_from_query_string(url_parameters(`#${latest.fragment}`));
+                        ui.back_up_diagram();
+                    }],
+                ], "backup");
+            }
+        }
+    };
+
+    // Back up the diagram whenever the page is hidden, as mobile browsers may discard background
+    // tabs without warning.
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") {
+            ui.back_up_diagram();
+        }
+    });
+    window.addEventListener("pagehide", () => ui.back_up_diagram());
+
     // Immediately load the KaTeX library as an ES6 module (regardless of the current renderer).
     KaTeX = import("/KaTeX/katex.mjs").then((module) => {
         // KaTeX is fast enough to be worth waiting for, but not
         // immediately available. In this case, we delay loading
         // the quiver until the library has loaded.
-        load_quiver_from_query_string();
+        load_quiver_or_backup();
         return module.default;
     }).catch(() => {
         // Handle KaTeX not loading (somewhat) gracefully.

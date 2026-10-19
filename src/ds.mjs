@@ -393,13 +393,13 @@ export class Colour extends Encodable {
 /// Returns a `Map` containing the current URL's query parameters, as well as parameters stored in
 /// the fragment identifier. If a parameter is found in both the query string and the fragment
 /// identifier, the query string parameter is prioritised.
-export function url_parameters() {
+export function url_parameters(href = window.location.href) {
     let data = [];
-    const fragment_string = window.location.hash.replace(/^#/, "");
+    const fragment_string = href.includes("#") ? href.slice(href.indexOf("#") + 1) : "";
     if (fragment_string !== "") {
         data = data.concat(fragment_string.split("&").map(segment => segment.split("=")));
     }
-    const query_string = window.location.href.match(/\?(.*)$/);
+    const query_string = href.match(/\?(.*)$/);
     if (query_string !== null) {
         data = data.concat(query_string[1].split("&").map(segment => segment.split("=")));
     }

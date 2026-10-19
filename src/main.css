@@ -107,6 +107,26 @@ noscript {
     transform: translateY(-100%);
 }
 
+.error-banner.notice {
+    background: var(--ui-black);
+}
+
+.error-banner.notice button:not(.close) {
+    margin-left: 12px;
+    padding: 4px 10px;
+
+    background: transparent;
+    border: 1px solid hsla(0, 0%, 100%, 0.6);
+    border-radius: 4px;
+
+    font: inherit;
+    color: var(--ui-white);
+}
+
+.error-banner.notice button:not(.close):hover {
+    background: hsla(0, 0%, 100%, 0.2);
+}
+
 .close {
     width: 28px; height: 28px;
     margin-left: 20px;
@@ -1315,6 +1335,11 @@ user has already pressed semicolon, placing us in command mode. */
     background: var(--ui-blue);
 }
 
+/* Actions that are toggled on, e.g. multiple selection. */
+.toolbar .action.toggled {
+    background: var(--ui-blue);
+}
+
 .toolbar .action img {
     width: 28px;
     vertical-align: middle;
@@ -1352,7 +1377,8 @@ user has already pressed semicolon, placing us in command mode. */
     border-radius: 0 0 8px 8px;
 }
 
-.toolbar .action:not(:disabled):hover .subtoolbar {
+.toolbar .action:not(:disabled):hover .subtoolbar,
+.toolbar .action.open:not(:disabled) .subtoolbar {
     display: block;
 }
 
@@ -1893,3 +1919,66 @@ body:has(select[name="renderer"] > option[value="katex"]:checked) .typst-only {
     }
 }
 
+/* Narrow screens (e.g. mobile devices) */
+
+/* Avoid overlapping the logo with the toolbar. */
+@media (max-width: 1200px) {
+    .toolbar {
+        left: calc(16px + 100px + 8px);
+        transform: none;
+    }
+}
+
+/* If the toolbar does not fit on the screen, allow it to be scrolled horizontally. */
+@media (max-width: 1084px) {
+    .toolbar {
+        right: 8px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: none;
+        /* `touch-action` is disabled on the `<body>`, so we need to re-enable scrolling. */
+        touch-action: pan-x;
+    }
+
+    .toolbar::-webkit-scrollbar {
+        display: none;
+    }
+
+    /* The subtoolbars would be clipped by the scrolling toolbar, so we display them in a fixed
+    position beneath the toolbar instead. */
+    .toolbar .action .subtoolbar {
+        position: fixed;
+        top: calc(16px + 60px);
+    }
+
+    .global {
+        max-width: calc(100% - 2 * 12px);
+        scrollbar-width: none;
+        touch-action: pan-x;
+    }
+
+    .global::-webkit-scrollbar {
+        display: none;
+    }
+}
+
+@media (max-width: 600px) {
+    #logo-link {
+        display: none;
+    }
+
+    .toolbar {
+        left: 8px;
+    }
+
+    .pane {
+        left: 8px;
+        right: 8px;
+        width: auto;
+        transform: none;
+    }
+
+    .pane.hidden {
+        transform: scale(0.75, 0.75);
+    }
+}
