@@ -522,13 +522,39 @@ being. */
     right: 16px;
 
     border-radius: 16px;
+    /* `touch-action` is disabled on the `<body>`, so we need to re-enable scrolling, for when the
+    panel is shrunk to avoid covering the selection. */
+    touch-action: pan-y;
 
-    transition: transform 0.1s;
+    transition: transform 0.1s, opacity 0.1s;
 }
 
 .side.panel.hidden {
     /* We use `translateX` instead of `right` to avoid continually performing layout. */
     transform: translateX(calc(16px * 18 + 16px));
+}
+
+.side.panel.left.hidden {
+    transform: translateX(calc(-16px * 18 - 16px));
+}
+
+/* While adjusting a control on the panel, if the panel covers the selection, we make it
+translucent so that the effect of the adjustment is visible. */
+.side.panel.translucent {
+    opacity: 0.3;
+}
+
+.side.panel button.move-panel {
+    display: block;
+    width: 32px; height: 20px;
+    margin: 0 0 8px 0;
+    padding: 0;
+
+    line-height: 16px;
+}
+
+.side.panel.left button.move-panel {
+    margin-left: auto;
 }
 
 .ui.connect .panel {
@@ -1196,6 +1222,11 @@ user has already pressed semicolon, placing us in command mode. */
     top: 50%;
     right: calc(16px * 20);
     transform: translateY(-50%);
+}
+
+.ui.panel-left .colour-panel.target-edge {
+    left: calc(16px * 20);
+    right: auto;
 }
 
 .colour-panel.hidden {
@@ -1965,6 +1996,25 @@ body:has(select[name="renderer"] > option[value="katex"]:checked) .typst-only {
 @media (max-width: 600px) {
     #logo-link {
         display: none;
+    }
+
+    .label-input-container {
+        width: calc(100% - 2 * 8px);
+        min-width: 0;
+    }
+
+    /* There is not enough space to display the colour panel beside the side panel, so we display it
+    in the centre of the screen. */
+    .colour-panel.target-edge, .ui.panel-left .colour-panel.target-edge,
+    .colour-panel.target-label {
+        left: 50%;
+        right: auto;
+        max-width: calc(100% - 2 * 8px - 2 * 16px);
+        transform: translateX(-50%);
+    }
+
+    .colour-panel.target-edge, .ui.panel-left .colour-panel.target-edge {
+        top: calc(16px + 60px + 8px);
     }
 
     .toolbar {

@@ -34,6 +34,9 @@ Object.assign(CONSTANTS, {
     /// How much padding to try to keep around the focus point when moving it via the keyboard
     /// (in pixels).
     VIEW_PADDING: 128,
+    /// The minimum height of the side panel (in pixels), when it is shrunk to avoid covering the
+    /// selection. This is roughly enough to display a single control.
+    PANEL_MIN_HEIGHT: 64,
     /// How long the user has to hold down on a touchscreen to trigger panning.
     LONG_PRESS_DURATION: 800,
     /// How much to shorten edges connected to edges by (in %), by default.
@@ -763,6 +766,18 @@ class UI {
 
         // Backups of the diagram in `localStorage`, so that work is not lost if the page is closed.
         this.backup = new LocalBackup();
+
+        // How far (in screen pixels) the view has been panned upwards automatically, so that the
+        // label input does not cover the selection. We pan back when the selection is cleared.
+        this.view_bump = 0;
+        // Whether the view is currently being panned automatically (as opposed to by the user).
+        this.auto_panning = false;
+        // Whether a pointer is currently held. We avoid moving things around while it is.
+        this.pointer_held = false;
+        // The pending animation frame for `update_layout`, if any.
+        this.layout_frame = null;
+        // Whether the next layout should reposition the panel even if the selection is unchanged.
+        this.relayout = false;
     }
 
     /// Clear the current diagram. This also clears the history.
@@ -852,7 +867,7 @@ class UI {
         this.element.add(this.panel.element);
         this.colour_picker.initialise(this);
         this.element.add(this.colour_picker.element);
-        this.panel.update_position();
+        this.schedule_layout();
         this.element.add(this.panel.global);
 
         // The label colour picker.
@@ -1344,9 +1359,24 @@ class UI {
             // Adjust the grid so that it aligns with the content.
             this.update_grid();
 
-            // Centre the panel.
-            this.panel.update_position();
+            // Reposition the panel (and possibly the view), as there may be more or less space.
+            this.schedule_layout(true);
         });
+
+        // Keep track of whether a pointer is held, so that we can avoid rearranging the interface
+        // (e.g. panning the view so the selection is not covered by the label input) while the user
+        // may be dragging. Once the pointer is released, we rearrange the interface if necessary.
+        window.addEventListener(pointer_event("down"), () => {
+            this.pointer_held = true;
+        }, { capture: true });
+        for (const type of ["up", "cancel"]) {
+            window.addEventListener(pointer_event(type), () => {
+                if (this.pointer_held) {
+                    this.pointer_held = false;
+                    this.schedule_layout();
+                }
+            }, { capture: true });
+        }
 
         // Add a move to the history.
         const commit_move_event = () => {
@@ -1451,6 +1481,12 @@ class UI {
                 const on_interface = event.target instanceof Element && event.target.closest(
                     ".toolbar, .panel, .pane, .error-banner, .label-input-container"
                 ) !== null;
+                // If the first touch started moving cells, we finish moving them, so that the
+                // user can pan or zoom instead.
+                if (!on_interface && this.in_mode(UIMode.PointerMove)) {
+                    commit_move_event();
+                    this.switch_mode(UIMode.default);
+                }
                 if (pinch === null && !on_interface
                     && this.in_mode(UIMode.Default, UIMode.Connect, UIMode.Pan)
                 ) {
@@ -3044,6 +3080,7 @@ class UI {
             if (this.selection.size > 0) {
                 this.panel.label_input.parent.class_list.remove("hidden");
             }
+            this.schedule_layout();
         }
     }
 
@@ -3066,6 +3103,7 @@ class UI {
         this.update_focus_tooltip();
         this.panel.update(this);
         this.toolbar.update(this);
+        this.schedule_layout();
     }
 
     /// Adds a cell to the canvas.
@@ -3137,6 +3175,10 @@ class UI {
 
     /// Repositions the view by an absolute offset.
     pan_to(offset, zoom = this.scale) {
+        // If the user moves the view themselves, we should not later undo the automatic panning.
+        if (!this.auto_panning) {
+            this.view_bump = 0;
+        }
         this.view.x = offset.x;
         this.view.y = offset.y;
         this.scale = zoom;
@@ -3201,6 +3243,130 @@ class UI {
             this.ids.set(object, this.ids.size);
         }
         return this.ids.get(object);
+    }
+
+    /// Rearrange the interface around the selection (on the next frame, so that multiple changes
+    /// to the selection are handled together).
+    schedule_layout(relayout = false) {
+        this.relayout ||= relayout;
+        if (this.layout_frame === null) {
+            this.layout_frame = window.requestAnimationFrame(() => {
+                this.layout_frame = null;
+                this.update_layout();
+            });
+        }
+    }
+
+    /// Rearrange the interface so that it covers as little of the selection as possible.
+    update_layout() {
+        if (this.in_mode(UIMode.Embedded) || this.panel.element === null) {
+            return;
+        }
+        // We don't want to move things around under the user's pointer. We will be called again
+        // when the pointer is released.
+        if (this.pointer_held) {
+            return;
+        }
+        this.bump_view();
+        this.panel.place(this, this.relayout);
+        this.relayout = false;
+    }
+
+    /// Returns the bounding rectangle (in screen coordinates) of the selected cells (only edges,
+    /// if `edges_only`), or `null` if there are none.
+    selection_rect(edges_only = false) {
+        let rect = null;
+        for (const cell of this.selection) {
+            if (edges_only && !cell.is_edge()) {
+                continue;
+            }
+            const elements = cell.is_vertex()
+                ? [cell.element.query_selector(".content")]
+                : [
+                    cell.element.query_selector("path.arrow-edge"),
+                    cell.element.query_selector(".label"),
+                ];
+            for (const element of elements) {
+                if (element === null) {
+                    continue;
+                }
+                const { left, top, right, bottom } = element.bounding_rect();
+                if (right <= left || bottom <= top) {
+                    continue;
+                }
+                rect = rect === null ? { left, top, right, bottom } : {
+                    left: Math.min(rect.left, left),
+                    top: Math.min(rect.top, top),
+                    right: Math.max(rect.right, right),
+                    bottom: Math.max(rect.bottom, bottom),
+                };
+            }
+        }
+        return rect;
+    }
+
+    /// Returns the vertical range `[top, bottom]` of the screen that is not covered by fixed
+    /// interface elements (the toolbar, and the label input and global panel), between the
+    /// horizontal coordinates `left` and `right`.
+    free_vertical_range(left, right) {
+        const MARGIN = 16;
+        const GAP = 8;
+        let [top, bottom] = [MARGIN, document.body.offsetHeight - MARGIN];
+        const overlaps = (rect) => rect.left < right && rect.right > left;
+        for (const element of [this.toolbar.element, new DOM.Element(document.body)
+            .query_selector("#logo-link .logo")]
+        ) {
+            if (element !== null) {
+                const rect = element.bounding_rect();
+                if (rect.width > 0 && overlaps(rect)) {
+                    top = Math.max(top, rect.bottom + GAP);
+                }
+            }
+        }
+        const label_bar = this.panel.label_input.parent;
+        for (const element of [label_bar, this.panel.global]) {
+            if (element === label_bar && label_bar.class_list.contains("hidden")) {
+                continue;
+            }
+            // We use `offsetTop`, rather than the bounding rectangle, for the vertical position,
+            // as the latter is affected by the transition when the label input is revealed.
+            if (overlaps(element.bounding_rect())) {
+                bottom = Math.min(bottom, element.element.offsetTop - GAP);
+            }
+        }
+        return [top, bottom];
+    }
+
+    /// If the label input covers the selection, pan the view upwards to reveal the selection.
+    /// We keep track of how far we have panned, so that we can pan back afterwards.
+    bump_view() {
+        const label_bar = this.panel.label_input.parent;
+        let bump = 0;
+        const rect = this.selection_rect();
+        if (rect !== null && !label_bar.class_list.contains("hidden")) {
+            const bar = label_bar.bounding_rect();
+            if (rect.left < bar.right && rect.right > bar.left) {
+                // The selection's position if the view had not been bumped.
+                const [top, bottom] = [rect.top + this.view_bump, rect.bottom + this.view_bump];
+                const limit = label_bar.element.offsetTop - 8;
+                const [ceiling] = this.free_vertical_range(rect.left, rect.right);
+                bump = Math.max(0, Math.min(
+                    // Enough to reveal the selection...
+                    bottom - limit,
+                    // ...but not so much that we push the selection under the toolbar...
+                    top - ceiling,
+                    // ...and no more than the space taken up by the interface at the bottom (this
+                    // is not intended to reveal selections that are otherwise off-screen).
+                    document.body.offsetHeight - limit,
+                ));
+            }
+        }
+        if (bump !== this.view_bump) {
+            this.auto_panning = true;
+            this.pan_view(new Offset(0, (bump - this.view_bump) / 2 ** this.scale));
+            this.auto_panning = false;
+            this.view_bump = bump;
+        }
     }
 
     /// Whether a pointer or keyboard event should add to (or toggle cells in) the selection, rather
@@ -4480,6 +4646,8 @@ class Settings {
             "quiver.theme": CONSTANTS.THEMES.LIGHT,
             // Whether to autosave.
             "quiver.autosave": false,
+            // Which side of the screen the side panel is displayed on, by default.
+            "quiver.panel_side": "right",
         };
         try {
             // Try to update the default values with the saved settings.
@@ -4524,6 +4692,20 @@ class Settings {
 /// A panel for editing cell data.
 class Panel {
     constructor() {
+        // The side of the screen on which the panel is currently displayed.
+        this.side = "right";
+
+        // Whether the user is currently adjusting a control on the panel.
+        this.adjusting = false;
+
+        // If the user has explicitly moved the panel to a side of the screen, we keep it there
+        // (rather than moving it automatically) until the selection changes. This is of the form
+        // `{ side, selection }`.
+        this.chosen_side = null;
+
+        // The selection and panel content height for which the panel was last positioned.
+        this.placed = null;
+
         // The panel element.
         this.element = null;
 
@@ -4569,8 +4751,42 @@ class Panel {
             event.stopImmediatePropagation();
         }, { passive: true });
 
+        // Keep track of whether the user is adjusting a control on the panel (i.e. holding the
+        // pointer down on it). While they are, we don't move the panel, and we make it translucent
+        // if it covers the selection. We listen in the capture phase, since the panel stops
+        // propagation of `pointerdown` events.
+        this.element.element.addEventListener(pointer_event("down"), () => {
+            this.adjusting = true;
+        }, { capture: true });
+        document.addEventListener(pointer_event("move"), () => {
+            if (this.adjusting) {
+                this.update_translucency(ui);
+            }
+        });
+        for (const type of ["up", "cancel"]) {
+            document.addEventListener(pointer_event(type), () => {
+                if (this.adjusting) {
+                    this.adjusting = false;
+                    this.update_translucency(ui);
+                }
+            });
+        }
+
         // Local options, such as vertex and edge actions.
         const wrapper = new DOM.Div({ class: "wrapper" }).add_to(this.element);
+
+        // A button to move the panel to the other side of the screen. This becomes the preferred
+        // side for the panel (though the panel will still move if it would otherwise cover the
+        // selection).
+        new DOM.Element("button", {
+            class: "move-panel",
+            title: "Move the panel to the other side of the screen",
+        }).add("⇆").listen("click", () => {
+            const side = this.side === "left" ? "right" : "left";
+            ui.settings.set("quiver.panel_side", side);
+            this.chosen_side = { side, selection: ui.selection };
+            this.place(ui, true);
+        }).add_to(wrapper);
 
         // The label.
         this.label_input = new DOM.Element("input", {
@@ -6884,7 +7100,7 @@ class Panel {
 
         // The panel size is not fixed, since we hide some options depending on the edge (e.g. the
         // edge alignment checkboxes), so we need to resize the panel after updating it.
-        this.update_position();
+        ui.schedule_layout();
     }
 
     /// Hide the panel off-screen.
@@ -6935,17 +7151,98 @@ class Panel {
     }
 
     /// Centre the panel vertically.
-    update_position() {
-        const panel_height
-            = this.element.query_selector(".wrapper").bounding_rect().height;
-        const document_height = document.body.offsetHeight;
-        const top_offset = Math.max(document_height - panel_height - 16 * 2, 0) / 2;
+    /// Position the side panel. The panel is displayed on the user's preferred side of the screen
+    /// (by default, the right), vertically centred. However, if this would cover the selected
+    /// edges, we try the other side of the screen, or shrink the panel (so that it scrolls) to fit
+    /// above or below the edges, whichever covers less of them. To avoid the panel jumping around
+    /// as the user modifies the selected edges, we only reposition the panel when the selection
+    /// (or the panel's contents) change, unless `relayout` is true.
+    place(ui, relayout = false) {
+        // We don't want to move the panel while the user is interacting with it.
+        if (this.element === null || this.adjusting) {
+            return;
+        }
+        const content_height = this.element.query_selector(".wrapper").element.offsetHeight;
+        if (!relayout && this.placed !== null && this.placed.selection === ui.selection
+            && this.placed.content_height === content_height
+        ) {
+            return;
+        }
+        this.placed = { selection: ui.selection, content_height };
+
+        const MARGIN = 16;
+        const GAP = 8;
+        const width = this.element.element.offsetWidth;
+        const min_height = Math.min(content_height, CONSTANTS.PANEL_MIN_HEIGHT);
+        const selection = ui.selection_rect(true);
+        const preferred = ui.settings.get("quiver.panel_side");
+        // The selection set is replaced whenever it changes, so we can detect whether it has
+        // changed since the user chose a side.
+        if (this.chosen_side !== null && this.chosen_side.selection !== ui.selection) {
+            this.chosen_side = null;
+        }
+        const sides = this.chosen_side !== null ? [this.chosen_side.side]
+            : [preferred, preferred === "left" ? "right" : "left"];
+
+        let best = null;
+        for (const side of sides) {
+            const left = side === "left" ? MARGIN : document.body.offsetWidth - MARGIN - width;
+            const [top_limit, bottom_limit] = ui.free_vertical_range(left, left + width);
+            const available = Math.max(bottom_limit - top_limit, min_height);
+            const full_height = Math.min(content_height, available);
+            let placement;
+            if (selection === null || selection.right <= left || selection.left >= left + width) {
+                // The panel doesn't horizontally overlap the selection.
+                placement = { top: top_limit + (available - full_height) / 2, height: full_height };
+            } else {
+                // Use the larger of the spaces above and below the selection.
+                const above = selection.top - GAP - top_limit;
+                const below = bottom_limit - (selection.bottom + GAP);
+                const space = Math.max(above, below, 0);
+                const height = clamp(min_height, space, full_height);
+                // If there is enough space, we centre the panel in it. Otherwise, the panel will
+                // have its minimum height and has to overlap the selection, so we place it as far
+                // from the selection as possible.
+                const fits = space >= height;
+                const top = above >= below
+                    ? top_limit + (fits ? (space - height) / 2 : 0)
+                    : (fits ? selection.bottom + GAP + (space - height) / 2 : bottom_limit - height);
+                placement = { top, height };
+            }
+            // How much of the selection the panel covers, and how much we have shrunk the panel.
+            const cover = Math.max(0, Math.min(selection?.right ?? 0, left + width)
+                - Math.max(selection?.left ?? 0, left))
+                * Math.max(0, Math.min(selection?.bottom ?? 0, placement.top + placement.height)
+                - Math.max(selection?.top ?? 0, placement.top));
+            const squash = full_height - placement.height;
+            if (best === null || cover < best.cover
+                || (cover === best.cover && squash < best.squash)
+            ) {
+                best = { side, cover, squash, ...placement };
+            }
+        }
+
+        this.side = best.side;
+        this.element.class_list.toggle("left", best.side === "left");
+        ui.element.class_list.toggle("panel-left", best.side === "left");
         this.element.set_style({
-            "margin-top": `${top_offset}px`,
-            // The bottom margin is not required for correct spacing, but is required so that the
-            // bottom area does not capture pointer events.
-            "margin-bottom": `${top_offset}px`,
+            left: best.side === "left" ? `${MARGIN}px` : "auto",
+            right: best.side === "right" ? `${MARGIN}px` : "auto",
+            top: `${best.top}px`,
+            bottom: "auto",
+            height: `${best.height}px`,
         });
+    }
+
+    /// Make the panel translucent while the user is adjusting a control on it, if the panel covers
+    /// any of the selected edges, so that the user can see the effect of the adjustment.
+    update_translucency(ui) {
+        const selection = ui.selection_rect(true);
+        const panel = this.element.bounding_rect();
+        const covers = this.adjusting && selection !== null
+            && selection.left < panel.right && selection.right > panel.left
+            && selection.top < panel.bottom && selection.bottom > panel.top;
+        this.element.class_list.toggle("translucent", covers);
     }
 
     /// Dismiss the import/export pane, if it is shown.
