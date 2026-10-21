@@ -9465,7 +9465,9 @@ document.addEventListener("DOMContentLoaded", () => {
     window.addEventListener("pagehide", () => ui.back_up_diagram());
 
     // Immediately load the KaTeX library as an ES6 module (regardless of the current renderer).
-    KaTeX = import("/KaTeX/katex.mjs").then((module) => {
+    // We use a relative path, so that quiver also works when it is not hosted at the root of a
+    // domain (e.g. on GitHub Pages at `<user>.github.io/quiver/`).
+    KaTeX = import("./KaTeX/katex.mjs").then((module) => {
         // KaTeX is fast enough to be worth waiting for, but not
         // immediately available. In this case, we delay loading
         // the quiver until the library has loaded.
