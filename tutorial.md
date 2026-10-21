@@ -149,7 +149,13 @@ The default theme is light. A dark theme, which alters the colour scheme of the 
 
 You can find all the keyboard shortcuts listed in the **Shortcuts** pane, which may be opened from the toolbar at the top of the window.
 
-For example, you can cut, copy, and paste using the usual keyboard shortcuts.
+For example, you can cut, copy, and paste using the usual keyboard shortcuts, or using the buttons in the toolbar. Copying also places a link to the copied cells on the system clipboard, so you can paste them into a diagram in another tab, or share them. Cells are pasted at the focus point (i.e. wherever you last clicked on the canvas).
+
+**quiver** keeps a backup of each tab's diagram in your browser's local storage. If a tab is reloaded or closed with unsaved changes (for instance, because a mobile browser discarded it in the background), the changes are restored when the tab is reopened. If you open **quiver** in a new tab, you will be offered the option to restore the most recent unsaved diagram.
+
+On a touchscreen, drag with two fingers to pan the view and pinch to zoom; or press and hold to start panning with one finger. Since there is no <kbd>Shift</kbd> key for selecting multiple cells, you can instead enable **Select → Multiple** in the toolbar, after which tapping cells adds them to (or removes them from) the selection. With a mouse, you can also pan by dragging with the middle mouse button.
+
+The panel for styling arrows is displayed on the right of the screen by default. You can move it to the other side with the <kbd>⇆</kbd> button at the top of the panel. If the panel would cover the selected arrows, it moves to the other side of the screen automatically, or (on small screens) shrinks to fit above or below them, in which case it can be scrolled. If it has to cover them anyway, it becomes translucent while you adjust a control, so you can see the effect. Similarly, if the label input at the bottom of the screen would cover the selection, the view is moved up while the selection is active.
 
 If anything is unclear, or you encounter any problems, you can report it in the [Issue Tracker](https://github.com/varkor/quiver/issues).
 
