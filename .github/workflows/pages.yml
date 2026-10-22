@@ -1,0 +1,70 @@
+# Build quiver and publish it to GitHub Pages whenever `master` is updated.
+#
+# To enable this, go to the repository's Settings → Pages, and set "Source" to "GitHub Actions".
+# The site will then be published at `https://<user>.github.io/<repository>/`.
+#
+# This replaces `make gh-pages` (which is specific to the upstream deployment at q.uiver.app) for
+# forks of quiver.
+name: Deploy to GitHub Pages
+
+on:
+  # Run whenever commits are pushed to (or merged into) `master`.
+  push:
+    branches: [master]
+  # Allow the workflow to be run manually from the "Actions" tab.
+  workflow_dispatch:
+
+# The permissions needed to publish to GitHub Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only run one deployment at a time. If a new commit arrives while a deployment is in progress, the
+# new deployment waits for the old one to finish, rather than cancelling it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Install ImageMagick (for generating the app icons)
+        run: command -v convert || (sudo apt-get update && sudo apt-get install -y imagemagick)
+
+      # Fetches KaTeX and Workbox, and generates the icons, as described in the `Makefile`.
+      - name: Fetch dependencies and generate icons
+        run: make
+
+      - name: Set up Node.js (for building the service worker)
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # The service worker lets quiver work offline. It has to be built after everything else has
+      # been added to `src/`, because it lists every file there so that they can be cached.
+      - name: Build the service worker
+        working-directory: service-worker
+        run: |
+          npm ci --no-audit --no-fund
+          node build.js
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: src
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
